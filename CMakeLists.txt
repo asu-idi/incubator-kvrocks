@@ -105,6 +105,10 @@ list(FILTER KVROCKS_SRCS EXCLUDE REGEX src/main.cc)
 
 add_library(kvrocks_objs OBJECT ${KVROCKS_SRCS})
 
+link_directories($ENV{HADOOP_HOME}/lib/native)
+link_directories($ENV{JAVA_HOME}/jre/lib/amd64/server)
+link_directories($ENV{JAVA_HOME}/jre/lib/amd64)
+
 target_include_directories(kvrocks_objs PUBLIC src ${PROJECT_BINARY_DIR})
 target_compile_features(kvrocks_objs PUBLIC cxx_std_17)
 target_compile_options(kvrocks_objs PUBLIC ${WARNING_FLAGS} -fno-omit-frame-pointer)
