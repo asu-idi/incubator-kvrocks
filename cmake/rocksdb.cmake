@@ -27,7 +27,7 @@ include(cmake/utils.cmake)
 
 FetchContent_DeclareGitHubWithMirrorR(rocksdb
   asu-idi/rocksdb-private.git
-  origin/remote_compaction
+  origin/kvrocks
 )
 
 FetchContent_GetProperties(jemalloc)
