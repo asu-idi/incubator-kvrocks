@@ -324,6 +324,22 @@ int GetPeerAddr(int fd, std::string *addr, uint32_t *port) {
   return 0;
 }
 
+int GetLocalPort(int fd) {
+  sockaddr_in6 address;
+  socklen_t len = sizeof(address);
+  if (getsockname(fd, (struct sockaddr *)&address, &len) == -1) {
+    return 0;
+  }
+
+  if (address.sin6_family == AF_INET) {
+    return ntohs(reinterpret_cast<sockaddr_in *>(&address)->sin_port);
+  } else if (address.sin6_family == AF_INET6) {
+    return ntohs(address.sin6_port);
+  }
+
+  return 0;
+}
+
 Status DecimalStringToNum(const std::string &str, int64_t *n, int64_t min, int64_t max) {
   try {
     *n = static_cast<int64_t>(std::stoll(str));
@@ -570,11 +586,11 @@ void BytesToHuman(char *buf, size_t size, uint64_t n) {
   }
 }
 
-void TokenizeRedisProtocol(const std::string &value, std::vector<std::string> *tokens) {
-  tokens->clear();
+std::vector<std::string> TokenizeRedisProtocol(const std::string &value) {
+  std::vector<std::string> tokens;
 
   if (value.empty()) {
-    return;
+    return tokens;
   }
 
   enum ParserState { stateArrayLen, stateBulkLen, stateBulkData };
@@ -585,12 +601,12 @@ void TokenizeRedisProtocol(const std::string &value, std::vector<std::string> *t
     switch (state) {
       case stateArrayLen:
         if (start[0] != '*') {
-          return;
+          return tokens;
         }
         p = strchr(start, '\r');
         if (!p || (p == end) || p[1] != '\n') {
-          tokens->clear();
-          return;
+          tokens.clear();
+          return tokens;
         }
         array_len = std::stoull(std::string(start+1, p));
         start = p + 2;
@@ -599,12 +615,12 @@ void TokenizeRedisProtocol(const std::string &value, std::vector<std::string> *t
 
       case stateBulkLen:
         if (start[0] != '$') {
-          return;
+          return tokens;
         }
         p = strchr(start, '\r');
         if (!p || (p == end) || p[1] != '\n') {
-          tokens->clear();
-          return;
+          tokens.clear();
+          return tokens;
         }
         bulk_len = std::stoull(std::string(start+1, p));
         start = p + 2;
@@ -613,18 +629,19 @@ void TokenizeRedisProtocol(const std::string &value, std::vector<std::string> *t
 
       case stateBulkData:
         if (bulk_len+2 > static_cast<uint64_t>(end-start)) {
-          tokens->clear();
-          return;
+          tokens.clear();
+          return tokens;
         }
-        tokens->emplace_back(std::string(start, start+bulk_len));
+        tokens.emplace_back(std::string(start, start+bulk_len));
         start += bulk_len + 2;
         state = stateBulkLen;
         break;
     }
   }
-  if (array_len != tokens->size()) {
-    tokens->clear();
+  if (array_len != tokens.size()) {
+    tokens.clear();
   }
+  return tokens;
 }
 
 bool IsPortInUse(int port) {

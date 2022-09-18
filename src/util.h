@@ -46,6 +46,7 @@ Status SockReadLine(int fd, std::string *data);
 Status SockSendFile(int out_fd, int in_fd, size_t size);
 Status SockSetBlocking(int fd, int blocking);
 int GetPeerAddr(int fd, std::string *addr, uint32_t *port);
+int GetLocalPort(int fd);
 bool IsPortInUse(int port);
 
 // string util
@@ -61,7 +62,7 @@ bool HasPrefix(const std::string &str, const std::string &prefix);
 int StringMatch(const std::string &pattern, const std::string &in, int nocase);
 int StringMatchLen(const char *p, int plen, const char *s, int slen, int nocase);
 std::string StringToHex(const std::string &input);
-void TokenizeRedisProtocol(const std::string &value, std::vector<std::string> *tokens);
+std::vector<std::string> TokenizeRedisProtocol(const std::string &value);
 
 void ThreadSetName(const char *name);
 int aeWait(int fd, int mask, uint64_t milliseconds);
@@ -75,4 +76,8 @@ std::unique_ptr<T> MakeUnique(Args&& ... args) {
   return std::unique_ptr<T>(new T(std::forward<Args>(args)...));
 }
 
+template <typename T, typename... Args>
+std::shared_ptr<T> MakeShared(Args&& ... args) {
+  return std::make_shared<T>(std::forward<Args>(args)...);
+}
 }  // namespace Util

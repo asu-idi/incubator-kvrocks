@@ -235,11 +235,11 @@ proc create_server_config_file {filename config} {
 
 proc spawn_server {config_file stdout stderr} {
     if {$::valgrind} {
-        set pid [exec valgrind --track-origins=yes --trace-children=yes --suppressions=[pwd]/src/valgrind.sup --show-reachable=no --show-possibly-lost=no --leak-check=full ./redis-server -c $config_file >> $stdout 2>> $stderr &]
+        set pid [exec valgrind --track-origins=yes --trace-children=yes --suppressions=[pwd]/src/valgrind.sup --show-reachable=no --show-possibly-lost=no --leak-check=full $::redis_server_path -c $config_file >> $stdout 2>> $stderr &]
     } elseif ($::stack_logging) {
-        set pid [exec /usr/bin/env MallocStackLogging=1 MallocLogFile=/tmp/malloc_log.txt ./redis-server -c $config_file >> $stdout 2>> $stderr &]
+        set pid [exec /usr/bin/env MallocStackLogging=1 MallocLogFile=/tmp/malloc_log.txt $::redis_server_path -c $config_file >> $stdout 2>> $stderr &]
     } else {
-        set pid [exec ./redis-server -c $config_file >> $stdout 2>> $stderr &]
+        set pid [exec $::redis_server_path -c $config_file >> $stdout 2>> $stderr &]
     }
 
     if {$::wait_server} {
@@ -255,13 +255,10 @@ proc spawn_server {config_file stdout stderr} {
 
 # Wait for actual startup, return 1 if port is busy, 0 otherwise
 proc wait_server_started {config_file stdout pid} {
-    set checkperiod 100; # Milliseconds
+    set checkperiod 1000; # Milliseconds
     set maxiter [expr {120*1000/$checkperiod}] ; # Wait up to 2 minutes.
     set port_busy 0
     while 1 {
-        if {[regexp -- " PID: $pid" [exec cat $stdout]]} {
-            break
-        }
         after $checkperiod
         incr maxiter -1
         if {$maxiter == 0} {
@@ -274,8 +271,11 @@ proc wait_server_started {config_file stdout pid} {
 
         # Check if the port is actually busy and the server failed
         # for this reason.
-        if {[regexp {Could not create server TCP} [exec cat $stdout]]} {
+        if {[regexp -- "Could not create server TCP" [exec cat $stdout]]} {
             set port_busy 1
+            break
+        }
+        if {[count_log_message [dict get $config_file "dir"] "Ready to accept"] > 0} {
             break
         }
     }
@@ -388,7 +388,8 @@ proc start_server {options {code undefined}} {
     # start every server on a different port
     set port [find_available_port $::baseport $::portcount]
     if {$::tls} {
-        dict set config "port" 0
+        set notls_port [find_available_port $::baseport $::portcount]
+        dict set config "port" $notls_port
         dict set config "tls-port" $port
         dict set config "tls-cluster" "yes"
         dict set config "tls-replication" "yes"
@@ -442,7 +443,7 @@ proc start_server {options {code undefined}} {
 
         # check that the server actually started
         set port_busy 0
-        # set port_busy [wait_server_started $config_file $stdout $pid]
+        set port_busy [wait_server_started $config $stdout $pid]
 
         # Sometimes we have to try a different port, even if we checked
         # for availability. Other test clients may grab the port before we

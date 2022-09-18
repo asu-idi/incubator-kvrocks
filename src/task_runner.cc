@@ -23,19 +23,16 @@
 #include <thread>
 #include "util.h"
 
-Status TaskRunner::Publish(Task task) {
-  mu_.lock();
+Status TaskRunner::Publish(const Task &task) {
+  std::lock_guard<std::mutex> guard(mu_);
   if (stop_) {
-    mu_.unlock();
     return Status(Status::NotOK, "the runner was stopped");
   }
   if (task_queue_.size() >= max_queue_size_) {
-    mu_.unlock();
     return Status(Status::NotOK, "the task queue was reached max length");
   }
   task_queue_.emplace_back(task);
   cond_.notify_all();
-  mu_.unlock();
   return Status::OK();
 }
 
@@ -50,10 +47,9 @@ void TaskRunner::Start() {
 }
 
 void TaskRunner::Stop() {
-  mu_.lock();
+  std::lock_guard<std::mutex> guard(mu_);
   stop_ = true;
   cond_.notify_all();
-  mu_.unlock();
 }
 
 void TaskRunner::Join() {
@@ -63,10 +59,9 @@ void TaskRunner::Join() {
 }
 
 void TaskRunner::Purge() {
-  mu_.lock();
+  std::lock_guard<std::mutex> guard(mu_);
   threads_.clear();
   task_queue_.clear();
-  mu_.unlock();
 }
 
 void TaskRunner::run() {
@@ -78,7 +73,7 @@ void TaskRunner::run() {
       task = task_queue_.front();
       task_queue_.pop_front();
       lock.unlock();
-      if (task.callback) task.callback(task.arg);
+      if (task) task();
       lock.lock();
     }
   }

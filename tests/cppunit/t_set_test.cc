@@ -19,24 +19,23 @@
  */
 
 #include <gtest/gtest.h>
+#include <memory>
 #include "redis_set.h"
 #include "test_base.h"
 
 class RedisSetTest : public TestBase {
 protected:
   explicit RedisSetTest() : TestBase() {
-    set = new Redis::Set(storage_, "set_ns");
+    set = Util::MakeUnique<Redis::Set>(storage_, "set_ns");
   }
-  ~RedisSetTest() {
-    delete set;
-  }
+  ~RedisSetTest() = default;
   void SetUp() override {
     key_ = "test-set-key";
     fields_ = {"set-key-1", "set-key-2", "set-key-3", "set-key-4"};
   }
 
 protected:
-  Redis::Set *set;
+  std::unique_ptr<Redis::Set> set;
 };
 
 TEST_F(RedisSetTest, AddAndRemove) {
@@ -80,6 +79,26 @@ TEST_F(RedisSetTest, IsMember) {
   EXPECT_TRUE(s.ok() && ret == 0);
   s = set->Remove(key_, fields_, &ret);
   EXPECT_TRUE(s.ok() && static_cast<int>(fields_.size()) == ret);
+  set->Del(key_);
+}
+
+TEST_F(RedisSetTest, MIsMember) {
+  int ret;
+  std::vector<int> exists;
+  rocksdb::Status s = set->Add(key_, fields_, &ret);
+  EXPECT_TRUE(s.ok() && static_cast<int>(fields_.size()) == ret);
+  s = set->MIsMember(key_, fields_, &exists);
+  EXPECT_TRUE(s.ok());
+  for (size_t i = 0; i < fields_.size(); i++) {
+    EXPECT_TRUE(exists[i] == 1);
+  }
+  s = set->Remove(key_, {fields_[0]}, &ret);
+  EXPECT_TRUE(s.ok() && ret == 1);
+  s = set->MIsMember(key_, fields_, &exists);
+  EXPECT_TRUE(s.ok() && exists[0] == 0);
+  for (size_t i = 1; i < fields_.size(); i++) {
+    EXPECT_TRUE(exists[i] == 1);
+  }
   set->Del(key_);
 }
 

@@ -218,7 +218,7 @@ rocksdb::Status ZSet::Range(const Slice &user_key, int start, int stop, uint8_t 
   bool reversed = (flags & (uint8_t)ZSET_REVERSED) != 0;
 
   std::unique_ptr<LockGuard> lock_guard;
-  if (removed) lock_guard = std::unique_ptr<LockGuard>(new LockGuard(storage_->GetLockManager(), ns_key));
+  if (removed) lock_guard = Util::MakeUnique<LockGuard>(storage_->GetLockManager(), ns_key);
   ZSetMetadata metadata(false);
   rocksdb::Status s = GetMetadata(ns_key, &metadata);
   if (!s.ok()) return s.IsNotFound()? rocksdb::Status::OK():s;
@@ -296,7 +296,7 @@ rocksdb::Status ZSet::RangeByScore(const Slice &user_key,
   AppendNamespacePrefix(user_key, &ns_key);
 
   std::unique_ptr<LockGuard> lock_guard;
-  if (spec.removed) lock_guard = std::unique_ptr<LockGuard>(new LockGuard(storage_->GetLockManager(), ns_key));
+  if (spec.removed) lock_guard = Util::MakeUnique<LockGuard>(storage_->GetLockManager(), ns_key);
   ZSetMetadata metadata(false);
   rocksdb::Status s = GetMetadata(ns_key, &metadata);
   if (!s.ok()) return s.IsNotFound()? rocksdb::Status::OK():s;
@@ -420,8 +420,8 @@ rocksdb::Status ZSet::RangeByLex(const Slice &user_key,
 
   std::unique_ptr<LockGuard> lock_guard;
   if (spec.removed) {
-    lock_guard = std::unique_ptr<LockGuard>(
-      new LockGuard(storage_->GetLockManager(), ns_key));
+    lock_guard = Util::MakeUnique<LockGuard>(
+      storage_->GetLockManager(), ns_key);
   }
   ZSetMetadata metadata(false);
   rocksdb::Status s = GetMetadata(ns_key, &metadata);
@@ -477,7 +477,7 @@ rocksdb::Status ZSet::RangeByLex(const Slice &user_key,
     if (spec.offset >= 0 && pos++ < spec.offset) continue;
     if (spec.removed) {
       std::string score_bytes = iter->value().ToString();
-      score_bytes.append(member.ToString());
+      score_bytes.append(member.data(), member.size());
       std::string score_key;
       InternalKey(ns_key, score_bytes, metadata.version, storage_->IsSlotIdEncoded()).Encode(&score_key);
       batch.Delete(score_cf_handle_, score_key);
@@ -538,7 +538,7 @@ rocksdb::Status ZSet::Remove(const Slice &user_key, const std::vector<Slice> &me
     std::string score_bytes;
     s = db_->Get(rocksdb::ReadOptions(), member_key, &score_bytes);
     if (s.ok()) {
-      score_bytes.append(member.ToString());
+      score_bytes.append(member.data(), member.size());
       InternalKey(ns_key, score_bytes, metadata.version, storage_->IsSlotIdEncoded()).Encode(&score_key);
       batch.Delete(member_key);
       batch.Delete(score_cf_handle_, score_key);

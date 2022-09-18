@@ -24,11 +24,12 @@
 #include <sys/statvfs.h>
 #include <sys/utsname.h>
 #include <sys/resource.h>
-#include <utility>
 #include <memory>
+#include <utility>
 #include <glog/logging.h>
 #include <rocksdb/convenience.h>
 
+#include <tls_util.h>
 #include "util.h"
 #include "worker.h"
 #include "version.h"
@@ -50,8 +51,18 @@ Server::Server(Engine::Storage *storage, Config *config) :
     stats_.commands_stats[iter.first].latency = 0;
   }
 
+#ifdef ENABLE_OPENSSL
+  // init ssl context
+  if (config->tls_port) {
+    ssl_ctx_ = CreateSSLContext(config);
+    if (!ssl_ctx_) {
+      exit(1);
+    }
+  }
+#endif
+
   // Init cluster
-  cluster_ = std::unique_ptr<Cluster>(new Cluster(this, config_->binds, config_->port));
+  cluster_ = Util::MakeUnique<Cluster>(this, config_->binds, config_->port);
 
   for (int i = 0; i < config->workers; i++) {
     auto worker = Util::MakeUnique<Worker>(this, config);
@@ -60,10 +71,11 @@ Server::Server(Engine::Storage *storage, Config *config) :
     if (!config->unixsocket.empty() && i == 0) {
       Status s = worker->ListenUnixSocket(config->unixsocket, config->unixsocketperm, config->backlog);
       if (!s.IsOK()) {
-        LOG(ERROR) << "[server] Failed to listen on unix socket: "<< config->unixsocket
+        LOG(ERROR) << "[server] Failed to listen on unix socket: " << config->unixsocket
                    << ", encounter error: " << s.Msg();
         exit(1);
       }
+      LOG(INFO) << "[server] Listening on unix socket: " << config->unixsocket;
     }
     worker_threads_.emplace_back(Util::MakeUnique<WorkerThread>(std::move(worker)));
   }
@@ -81,6 +93,19 @@ Server::~Server() {
   for (const auto &iter : conn_ctxs_) {
     delete iter.first;
   }
+
+  // Wait for all fetch file threads stop and exit and force destroy
+  // the server after 60s.
+  int counter = 0;
+  while (GetFetchFileThreadNum() != 0) {
+    usleep(100000);
+    if (++counter == 600) {
+      LOG(WARNING) << "Will force destroy the server after waiting 60s, leave " << GetFetchFileThreadNum()
+                   << " fetch file threads are still running";
+      break;
+    }
+  }
+  Lua::DestroyState(lua_);
 }
 
 // Kvrocks threads list:
@@ -106,8 +131,8 @@ Status Server::Start() {
 
   if (config_->cluster_enabled) {
     // Create objects used for slot migration
-    slot_migrate_ = std::unique_ptr<SlotMigrate>(new SlotMigrate(this, config_->migrate_speed,
-                                    config_->pipeline_size, config_->sequence_gap));
+    slot_migrate_ = Util::MakeUnique<SlotMigrate>(this, config_->migrate_speed,
+                                    config_->pipeline_size, config_->sequence_gap);
     slot_import_ = new SlotImport(this);
     // Create migrating thread
     auto s = slot_migrate_->CreateMigrateHandleThread();
@@ -117,7 +142,7 @@ Status Server::Start() {
     }
   }
 
-  for (const auto& worker : worker_threads_) {
+  for (const auto &worker : worker_threads_) {
     worker->Start();
   }
   task_runner_.Start();
@@ -149,7 +174,8 @@ Status Server::Start() {
         && local_time.tm_hour <= config_->compaction_checker_range.Stop) {
           std::vector<std::string> cf_names = {Engine::kMetadataColumnFamilyName,
                                                Engine::kSubkeyColumnFamilyName,
-                                               Engine::kZSetScoreColumnFamilyName};
+                                               Engine::kZSetScoreColumnFamilyName,
+                                               Engine::kStreamColumnFamilyName};
           for (const auto &cf_name : cf_names) {
             compaction_checker.PickCompactionFiles(cf_name);
           }
@@ -171,7 +197,7 @@ Status Server::Start() {
 void Server::Stop() {
   stop_ = true;
   if (replication_thread_) replication_thread_->Stop();
-  for (const auto& worker : worker_threads_) {
+  for (const auto &worker : worker_threads_) {
     worker->Stop();
   }
   DisconnectSlaves();
@@ -180,7 +206,7 @@ void Server::Stop() {
 }
 
 void Server::Join() {
-  for (const auto& worker : worker_threads_) {
+  for (const auto &worker : worker_threads_) {
     worker->Join();
   }
   task_runner_.Join();
@@ -189,13 +215,12 @@ void Server::Join() {
 }
 
 Status Server::AddMaster(std::string host, uint32_t port, bool force_reconnect) {
-  slaveof_mu_.lock();
+  std::lock_guard<std::mutex> guard(slaveof_mu_);
 
   // Don't check host and port if 'force_reconnect' argument is set to true
   if (!force_reconnect &&
       !master_host_.empty() && master_host_ == host &&
       master_port_ == port) {
-    slaveof_mu_.unlock();
     return Status::OK();
   }
 
@@ -226,12 +251,11 @@ Status Server::AddMaster(std::string host, uint32_t port, bool force_reconnect) 
   } else {
     replication_thread_ = nullptr;
   }
-  slaveof_mu_.unlock();
   return s;
 }
 
 Status Server::RemoveMaster() {
-  slaveof_mu_.lock();
+  std::lock_guard<std::mutex> guard(slaveof_mu_);
   if (!master_host_.empty()) {
     master_host_.clear();
     master_port_ = 0;
@@ -240,7 +264,6 @@ Status Server::RemoveMaster() {
     replication_thread_ = nullptr;
     storage_->ShiftReplId();
   }
-  slaveof_mu_.unlock();
   return Status::OK();
 }
 
@@ -258,7 +281,7 @@ Status Server::AddSlave(Redis::Connection *conn, rocksdb::SequenceNumber next_re
 }
 
 void Server::DisconnectSlaves() {
-  slave_threads_mu_.lock();
+  std::lock_guard<std::mutex> guard(slaveof_mu_);
   for (const auto &slave_thread : slave_threads_) {
     if (!slave_thread->IsStopped()) slave_thread->Stop();
   }
@@ -268,12 +291,11 @@ void Server::DisconnectSlaves() {
     slave_thread->Join();
     delete slave_thread;
   }
-  slave_threads_mu_.unlock();
 }
 
 void Server::cleanupExitedSlaves() {
   std::list<FeedSlaveThread *> exited_slave_threads;
-  slave_threads_mu_.lock();
+  std::lock_guard<std::mutex> guard(slaveof_mu_);
   for (const auto &slave_thread : slave_threads_) {
     if (slave_thread->IsStopped())
       exited_slave_threads.emplace_back(slave_thread);
@@ -285,7 +307,6 @@ void Server::cleanupExitedSlaves() {
     t->Join();
     delete t;
   }
-  slave_threads_mu_.unlock();
 }
 
 void Server::FeedMonitorConns(Redis::Connection *conn, const std::vector<std::string> &tokens) {
@@ -448,6 +469,7 @@ void Server::AddBlockingKey(const std::string &key, Redis::Connection *conn) {
   } else {
     iter->second.emplace_back(conn_ctx);
   }
+  IncrBlockedClientNum();
 }
 
 void Server::UnBlockingKey(const std::string &key, Redis::Connection *conn) {
@@ -466,6 +488,47 @@ void Server::UnBlockingKey(const std::string &key, Redis::Connection *conn) {
       break;
     }
   }
+  DecrBlockedClientNum();
+}
+
+void Server::BlockOnStreams(const std::vector<std::string> &keys,
+                            const std::vector<Redis::StreamEntryID> &entry_ids, Redis::Connection *conn) {
+  std::lock_guard<std::mutex> guard(blocking_keys_mu_);
+  IncrBlockedClientNum();
+  for (size_t i = 0; i < keys.size(); ++i) {
+    auto consumer = std::make_shared<StreamConsumer>(
+          conn->Owner(), conn->GetFD(), conn->GetNamespace(), entry_ids[i]);
+    auto iter = blocked_stream_consumers_.find(keys[i]);
+    if (iter == blocked_stream_consumers_.end()) {
+      std::set<std::shared_ptr<StreamConsumer>> consumers;
+      consumers.insert(consumer);
+      blocked_stream_consumers_.insert(std::make_pair(keys[i], consumers));
+    } else {
+      iter->second.insert(consumer);
+    }
+  }
+}
+
+void Server::UnblockOnStreams(const std::vector<std::string> &keys, Redis::Connection *conn) {
+  std::lock_guard<std::mutex> guard(blocking_keys_mu_);
+  DecrBlockedClientNum();
+  for (const auto &key : keys) {
+    auto iter = blocked_stream_consumers_.find(key);
+    if (iter == blocked_stream_consumers_.end()) {
+      continue;
+    }
+
+    for (auto it = iter->second.begin(); it != iter->second.end(); ) {
+      auto consumer = *it;
+      if (conn->GetFD() == consumer->fd && conn->Owner() == consumer->owner) {
+        iter->second.erase(it);
+        if (iter->second.empty()) {
+          blocked_stream_consumers_.erase(iter);
+        }
+        break;
+      }
+    }
+  }
 }
 
 Status Server::WakeupBlockingConns(const std::string &key, size_t n_conns) {
@@ -480,6 +543,27 @@ Status Server::WakeupBlockingConns(const std::string &key, size_t n_conns) {
     delConnContext(conn_ctx);
     iter->second.pop_front();
   }
+  return Status::OK();
+}
+
+Status Server::OnEntryAddedToStream(const std::string &ns, const std::string &key,
+                                    const Redis::StreamEntryID &entry_id) {
+  std::lock_guard<std::mutex> guard(blocking_keys_mu_);
+  auto iter = blocked_stream_consumers_.find(key);
+  if (iter == blocked_stream_consumers_.end() || iter->second.empty()) {
+    return Status(Status::NotOK);
+  }
+
+  for (auto it = iter->second.begin(); it != iter->second.end(); ) {
+    auto consumer = *it;
+    if (consumer->ns == ns && entry_id > consumer->last_consumed_id) {
+      consumer->owner->EnableWriteEvent(consumer->fd);
+      it = iter->second.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
   return Status::OK();
 }
 
@@ -514,12 +598,20 @@ int Server::DecrMonitorClientNum() {
   return monitor_clients_.fetch_sub(1, std::memory_order_relaxed);
 }
 
+int Server::IncrBlockedClientNum() {
+  return blocked_clients_.fetch_add(1, std::memory_order_relaxed);
+}
+
+int Server::DecrBlockedClientNum() {
+  return blocked_clients_.fetch_sub(1, std::memory_order_relaxed);
+}
+
 std::unique_ptr<RWLock::ReadLock> Server::WorkConcurrencyGuard() {
-  return std::unique_ptr<RWLock::ReadLock>(new RWLock::ReadLock(works_concurrency_rw_lock_));
+  return Util::MakeUnique<RWLock::ReadLock>(works_concurrency_rw_lock_);
 }
 
 std::unique_ptr<RWLock::WriteLock> Server::WorkExclusivityGuard() {
-  return std::unique_ptr<RWLock::WriteLock>(new RWLock::WriteLock(works_concurrency_rw_lock_));
+  return Util::MakeUnique<RWLock::WriteLock>(works_concurrency_rw_lock_);
 }
 
 std::atomic<uint64_t> *Server::GetClientID() {
@@ -732,6 +824,7 @@ void Server::GetClientsInfo(std::string *info) {
   string_stream << "maxclients:" << config_->maxclients << "\r\n";
   string_stream << "connected_clients:" << connected_clients_ << "\r\n";
   string_stream << "monitor_clients:" << monitor_clients_ << "\r\n";
+  string_stream << "blocked_clients:" << blocked_clients_ << "\r\n";
   *info = string_stream.str();
 }
 
@@ -830,15 +923,13 @@ void Server::GetRoleInfo(std::string *info) {
 
 std::string Server::GetLastRandomKeyCursor() {
   std::string cursor;
-  last_random_key_cursor_mu_.lock();
+  std::lock_guard<std::mutex> guard(last_random_key_cursor_mu_);
   cursor = last_random_key_cursor_;
-  last_random_key_cursor_mu_.unlock();
   return cursor;
 }
 void Server::SetLastRandomKeyCursor(const std::string &cursor) {
-  last_random_key_cursor_mu_.lock();
+  std::lock_guard<std::mutex> guard(last_random_key_cursor_mu_);
   last_random_key_cursor_ = cursor;
-  last_random_key_cursor_mu_.unlock();
 }
 
 int Server::GetUnixTime() {
@@ -1073,16 +1164,13 @@ Status Server::AsyncCompactDB(const std::string &begin_key, const std::string &e
   }
   db_compacting_ = true;
 
-  Task task;
-  task.arg = this;
-  task.callback = [begin_key, end_key](void *arg) {
-    auto svr = static_cast<Server *>(arg);
+  Task task = [begin_key, end_key, this] {
     Slice *begin = nullptr, *end = nullptr;
     if (!begin_key.empty()) begin = new Slice(begin_key);
     if (!end_key.empty()) end = new Slice(end_key);
-    svr->storage_->Compact(begin, end);
-    std::lock_guard<std::mutex> lg(svr->db_job_mu_);
-    svr->db_compacting_ = false;
+    storage_->Compact(begin, end);
+    std::lock_guard<std::mutex> lg(db_job_mu_);
+    db_compacting_ = false;
     delete begin;
     delete end;
   };
@@ -1096,29 +1184,23 @@ Status Server::AsyncBgsaveDB() {
   }
   is_bgsave_in_progress_ = true;
 
-  Task task;
-  task.arg = this;
-  task.callback = [](void *arg) {
-    auto svr = static_cast<Server*>(arg);
+  Task task = [this] {
     auto start_bgsave_time = std::time(nullptr);
-    Status s = svr->storage_->CreateBackup();
+    Status s = storage_->CreateBackup();
     auto stop_bgsave_time = std::time(nullptr);
 
-    std::lock_guard<std::mutex> lg(svr->db_job_mu_);
-    svr->is_bgsave_in_progress_ = false;
-    svr->last_bgsave_time_ = static_cast<int>(start_bgsave_time);
-    svr->last_bgsave_status_ = s.IsOK() ? "ok" : "err";
-    svr->last_bgsave_time_sec_ = static_cast<int>(stop_bgsave_time-start_bgsave_time);
+    std::lock_guard<std::mutex> lg(db_job_mu_);
+    is_bgsave_in_progress_ = false;
+    last_bgsave_time_ = static_cast<int>(start_bgsave_time);
+    last_bgsave_status_ = s.IsOK() ? "ok" : "err";
+    last_bgsave_time_sec_ = static_cast<int>(stop_bgsave_time-start_bgsave_time);
   };
   return task_runner_.Publish(task);
 }
 
 Status Server::AsyncPurgeOldBackups(uint32_t num_backups_to_keep, uint32_t backup_max_keep_hours) {
-  Task task;
-  task.arg = this;
-  task.callback = [num_backups_to_keep, backup_max_keep_hours](void *arg) {
-    auto svr = static_cast<Server *>(arg);
-    svr->storage_->PurgeOldBackups(num_backups_to_keep, backup_max_keep_hours);
+  Task task = [num_backups_to_keep, backup_max_keep_hours, this] {
+    storage_->PurgeOldBackups(num_backups_to_keep, backup_max_keep_hours);
   };
   return task_runner_.Publish(task);
 }
@@ -1134,18 +1216,15 @@ Status Server::AsyncScanDBSize(const std::string &ns) {
   }
   db_scan_infos_[ns].is_scanning = true;
 
-  Task task;
-  task.arg = this;
-  task.callback = [ns](void *arg) {
-    auto svr = static_cast<Server*>(arg);
-    Redis::Database db(svr->storage_, ns);
+  Task task = [ns, this] {
+    Redis::Database db(storage_, ns);
     KeyNumStats stats;
     db.GetKeyNumStats("", &stats);
 
-    std::lock_guard<std::mutex> lg(svr->db_job_mu_);
-    svr->db_scan_infos_[ns].key_num_stats = stats;
-    time(&svr->db_scan_infos_[ns].last_scan_time);
-    svr->db_scan_infos_[ns].is_scanning = false;
+    std::lock_guard<std::mutex> lg(db_job_mu_);
+    db_scan_infos_[ns].key_num_stats = stats;
+    time(&db_scan_infos_[ns].last_scan_time);
+    db_scan_infos_[ns].is_scanning = false;
   };
   return task_runner_.Publish(task);
 }
@@ -1276,11 +1355,10 @@ std::string Server::GetClientsStr() {
   for (const auto &t : worker_threads_) {
     clients.append(t->GetWorker()->GetClientsStr());
   }
-  slave_threads_mu_.lock();
+  std::lock_guard<std::mutex> guard(slave_threads_mu_);
   for (const auto &st : slave_threads_) {
     clients.append(st->GetConn()->ToString());
   }
-  slave_threads_mu_.unlock();
   return clients;
 }
 

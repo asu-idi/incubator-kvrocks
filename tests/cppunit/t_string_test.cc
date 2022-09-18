@@ -19,17 +19,16 @@
  */
 
 #include <gtest/gtest.h>
+#include <memory>
 #include "test_base.h"
 #include "redis_string.h"
 
 class RedisStringTest : public TestBase {
 protected:
   explicit RedisStringTest() : TestBase() {
-    string = new Redis::String(storage_, "string_ns");
+    string = Util::MakeUnique<Redis::String>(storage_, "string_ns");
   }
-  ~RedisStringTest() {
-    delete string;
-  }
+  ~RedisStringTest() = default;
   void SetUp() override {
     key_ = "test-string-key";
     pairs_ = {
@@ -43,7 +42,7 @@ protected:
   }
 
 protected:
-  Redis::String *string;
+  std::unique_ptr<Redis::String> string;
   std::vector<StringPair> pairs_;
 };
 
@@ -75,7 +74,7 @@ TEST_F(RedisStringTest, MGetAndMSet) {
   string->MSet(pairs_);
   std::vector<Slice> keys;
   std::vector<std::string> values;
-  for (const auto pair : pairs_) {
+  for (const auto &pair : pairs_) {
     keys.emplace_back(pair.key);
   }
   string->MGet(keys, &values);
@@ -158,6 +157,20 @@ TEST_F(RedisStringTest, GetSet) {
   }
   string->Del(key_);
 }
+TEST_F(RedisStringTest, GetDel) {
+  for (size_t i = 0; i < pairs_.size(); i++) {
+    string->Set(pairs_[i].key.ToString(), pairs_[i].value.ToString());
+  }
+  for (size_t i = 0; i < pairs_.size(); i++) {
+    std::string got_value;
+    string->GetDel(pairs_[i].key.ToString(), &got_value);
+    EXPECT_EQ(pairs_[i].value, got_value);
+
+    std::string second_got_value;
+    auto s = string->GetDel(pairs_[i].key.ToString(), &second_got_value);
+    EXPECT_TRUE(!s.ok() && s.IsNotFound());
+  }
+}
 
 TEST_F(RedisStringTest, MSetXX) {
   int ret;
@@ -178,7 +191,7 @@ TEST_F(RedisStringTest, MSetNX) {
   EXPECT_EQ(1, ret);
   std::vector<Slice> keys;
   std::vector<std::string> values;
-  for (const auto pair : pairs_) {
+  for (const auto &pair : pairs_) {
     keys.emplace_back(pair.key);
   }
   string->MGet(keys, &values);

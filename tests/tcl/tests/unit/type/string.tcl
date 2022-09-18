@@ -180,12 +180,12 @@ start_server {tags {"string"}} {
     #      set ex
     #  } {*wrong number of arguments*}
 
-    # test "GETDEL command" {
-    #     r del foo
-    #     r set foo bar
-    #     assert_equal bar [r getdel foo ]
-    #     assert_equal {} [r getdel foo ]
-    # }
+    test "GETDEL command" {
+        r del foo
+        r set foo bar
+        assert_equal bar [r getdel foo ]
+        assert_equal {} [r getdel foo ]
+    }
 
     # test {GETDEL propagate as DEL command to replica} {
     #     set repl [attach_to_replication_stream]
@@ -567,6 +567,18 @@ start_server {tags {"string"}} {
     #     r set foo bar pxat [expr [clock milliseconds] + 10000]
     #     assert_range [r ttl foo] 5 10
     # }
+
+    test {Extended SET with incorrect use of multi options should result in syntax err} {
+      catch {r set foo bar ex 10 px 10000} err1
+      catch {r set foo bar NX XX} err2
+      list $err1 $err2
+    } {*syntax err* *syntax err*}
+
+    test {Extended SET with incorrect expire value} {
+        catch {r set foo bar ex 1234xyz} e
+        set e
+    } {*not an integer*}
+
     test {Extended SET using multiple options at once} {
         r set foo val
         assert {[r set foo bar xx px 10000] eq {OK}}

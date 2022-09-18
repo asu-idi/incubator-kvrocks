@@ -45,6 +45,7 @@
 #include "redis_pubsub.h"
 #include "redis_sortedint.h"
 #include "redis_slot.h"
+#include "redis_stream.h"
 #include "replication.h"
 #include "util.h"
 #include "storage.h"
@@ -66,6 +67,11 @@ const char *errWrongNumOfArguments = "wrong number of arguments";
 const char *errValueNotInterger = "value is not an integer or out of range";
 const char *errAdministorPermissionRequired = "administor permission required to perform the command";
 const char *errValueMustBePositive = "value is out of range, must be positive";
+const char *errNoSuchKey = "no such key";
+const char *errUnbalacedStreamList =
+    "Unbalanced XREAD list of streams: for each stream key an ID or '$' must be specified.";
+const char *errTimeoutIsNegative = "timeout is negative";
+const char *errLimitOptionNotAllowed = "syntax error, LIMIT cannot be used without the special ~ option";
 
 class CommandAuth : public Commander {
  public:
@@ -112,11 +118,13 @@ class CommandNamespace : public Commander {
           namespaces.emplace_back(iter->second);  // namespace
           namespaces.emplace_back(iter->first);   // token
         }
+        namespaces.emplace_back(kDefaultNamespace);
+        namespaces.emplace_back(config->requirepass);
         *output = Redis::MultiBulkString(namespaces, false);
       } else {
         std::string token;
         auto s = config->GetNamespace(args_[2], &token);
-        if (s.IsNotFound()) {
+        if (s.Is<Status::NotFound>()) {
           *output = Redis::NilString();
         } else {
           *output = Redis::BulkString(token);
@@ -323,6 +331,24 @@ class CommandGetSet : public Commander {
   }
 };
 
+class CommandGetDel : public Commander {
+ public:
+  Status Execute(Server *svr, Connection *conn, std::string *output) override {
+    Redis::String string_db(svr->storage_, conn->GetNamespace());
+    std::string value;
+    rocksdb::Status s = string_db.GetDel(args_[1], &value);
+    if (!s.ok() && !s.IsNotFound()) {
+      return Status(Status::RedisExecErr, s.ToString());
+    }
+    if (s.IsNotFound()) {
+      *output = Redis::NilString();
+    } else {
+      *output = Redis::BulkString(value);
+    }
+    return Status::OK();
+  }
+};
+
 class CommandGetRange: public Commander {
  public:
   Status Parse(const std::vector<std::string> &args) override {
@@ -425,21 +451,37 @@ class CommandSet : public Commander {
     for (size_t i = 3; i < args.size(); i++) {
       last_arg = (i == args.size()-1);
       std::string opt = Util::ToLower(args[i]);
-      if (opt == "nx") {
+      if (opt == "nx" && !xx_) {
         nx_ = true;
-      } else if (opt == "xx") {
+      } else if (opt == "xx" && !nx_) {
         xx_ = true;
-      } else if (opt == "ex") {
-        if (last_arg) return Status(Status::NotOK, errInvalidSyntax);
-        ttl_ = atoi(args_[++i].c_str());
+      } else if (opt == "ex" && !ttl_ && !last_arg) {
+        try {
+          std::string s = args_[++i];
+          std::string::size_type sz;
+          ttl_ = std::stoi(s, &sz);
+          if (sz != s.size()) {
+            return Status(Status::RedisParseErr, errValueNotInterger);
+          }
+        } catch (std::exception &e) {
+          return Status(Status::RedisParseErr, errValueNotInterger);
+        }
         if (ttl_ <= 0) return Status(Status::RedisParseErr, errInvalidExpireTime);
-      } else if (opt == "px") {
-        if (last_arg) return Status(Status::NotOK, errInvalidSyntax);
-        auto ttl_ms = atol(args[++i].c_str());
+      } else if (opt == "px" && !ttl_ && !last_arg) {
+        int64_t ttl_ms = 0;
+        try {
+          std::string s = args_[++i];
+          std::string::size_type sz;
+          ttl_ms = std::stol(s, &sz);
+          if (sz != s.size()) {
+            return Status(Status::RedisParseErr, errValueNotInterger);
+          }
+        } catch (std::exception &e) {
+          return Status(Status::RedisParseErr, errValueNotInterger);
+        }
         if (ttl_ms <= 0) return Status(Status::RedisParseErr, errInvalidExpireTime);
         if (ttl_ms > 0 && ttl_ms < 1000) {
-          // round up the pttl to second
-          ttl_ = 1;
+          ttl_ = 1;  // round up the pttl to second
         } else {
           ttl_ = static_cast<int>(ttl_ms/1000);
         }
@@ -1561,22 +1603,27 @@ class CommandBPop : public Commander {
       timeval tm = {timeout_, 0};
       evtimer_add(timer_, &tm);
     }
-    return Status::OK();
+    return Status(Status::BlockingCmd);
   }
 
   rocksdb::Status TryPopFromList() {
     Redis::List list_db(svr_->storage_, conn_->GetNamespace());
-    std::string last_key, elem;
+    std::string elem;
+    const std::string* last_key_ptr = nullptr;
     rocksdb::Status s;
     for (const auto &key : keys_) {
-      last_key = key;
+      last_key_ptr = &key;
       s = list_db.Pop(key, left_, &elem);
       if (s.ok() || !s.IsNotFound()) {
         break;
       }
     }
     if (s.ok()) {
-      conn_->Reply(Redis::MultiBulkString({last_key, elem}));
+      if (last_key_ptr == nullptr) {
+        conn_->Reply(Redis::MultiBulkString({"", std::move(elem)}));
+      } else {
+        conn_->Reply(Redis::MultiBulkString({*last_key_ptr, std::move(elem)}));
+      }
     } else if (!s.IsNotFound()) {
       conn_->Reply(Redis::Error("ERR " + s.ToString()));
       LOG(ERROR) << "Failed to execute redis command: " << conn_->current_cmd_->GetAttributes()->name
@@ -1588,12 +1635,13 @@ class CommandBPop : public Commander {
   static void WriteCB(bufferevent *bev, void *ctx) {
     auto self = reinterpret_cast<CommandBPop *>(ctx);
     auto s = self->TryPopFromList();
-    // if pop fail ,currently we compromised to close bpop request
     if (s.IsNotFound()) {
-      self->conn_->Reply(Redis::NilString());
-      LOG(ERROR) << "[BPOP] Failed to execute redis command: " << self->conn_->current_cmd_->GetAttributes()->name
-                 << ", err: another concurrent pop request must have stole the data before this bpop request"
-                 << " or bpop is in a pipeline cmd list(cmd before bpop replyed trigger this writecb)";
+      // The connection may be waked up but can't pop from list. For example,
+      // connection A is blocking on list and connection B push a new element
+      // then wake up the connection A, but this element may be token by other connection C.
+      // So we need to wait for the wake event again by disabling the WRITE event.
+      bufferevent_disable(bev, EV_WRITE);
+      return;
     }
     if (self->timer_ != nullptr) {
       event_free(self->timer_);
@@ -1603,6 +1651,10 @@ class CommandBPop : public Commander {
     bufferevent_setcb(bev, Redis::Connection::OnRead, Redis::Connection::OnWrite,
                       Redis::Connection::OnEvent, self->conn_);
     bufferevent_enable(bev, EV_READ);
+    // We need to manually trigger the read event since we will stop processing commands
+    // in connection after the blocking command, so there may have some commands to be processed.
+    // Related issue: https://github.com/apache/incubator-kvrocks/issues/831
+    bufferevent_trigger(bev, EV_READ, BEV_TRIG_IGNORE_WATERMARKS);
   }
 
   static void EventCB(bufferevent *bev, int16_t events, void *ctx) {
@@ -1945,6 +1997,31 @@ class CommandSIsMember : public Commander {
       return Status(Status::RedisExecErr, s.ToString());
     }
     *output = Redis::Integer(ret);
+    return Status::OK();
+  }
+};
+
+class CommandSMIsMember : public Commander {
+ public:
+  Status Execute(Server *svr, Connection *conn, std::string *output) override {
+    Redis::Set set_db(svr->storage_, conn->GetNamespace());
+    std::vector<Slice> members;
+    for (size_t i = 2; i < args_.size(); i++) {
+      members.emplace_back(Slice(args_[i]));
+    }
+
+    std::vector<int> exists;
+    rocksdb::Status s = set_db.MIsMember(args_[1], members, &exists);
+    if (!s.ok() && !s.IsNotFound()) {
+      return Status(Status::RedisExecErr, s.ToString());
+    }
+    if (s.IsNotFound()) {
+      exists.resize(members.size(), 0);
+    }
+    output->append(Redis::MultiLen(exists.size()));
+    for (const auto &exist : exists) {
+      output->append(Redis::Integer(exist));
+    }
     return Status::OK();
   }
 };
@@ -3346,7 +3423,7 @@ class CommandExec : public Commander {
     }
 
     // Reply multi length first
-    conn->Reply(Redis::MultiLen(conn->GetMultiExecCommands().size()));
+    conn->Reply(Redis::MultiLen(conn->GetMultiExecCommands()->size()));
     // Execute multi-exec commands
     conn->SetInExec();
     conn->ExecuteCommands(conn->GetMultiExecCommands());
@@ -4385,6 +4462,7 @@ class CommandFetchFile : public Commander {
       svr->IncrFetchFileThread();
 
       for (auto file : files) {
+        if (svr->IsStopped()) break;
         uint64_t file_size = 0, max_replication_bytes = 0;
         if (svr->GetConfig()->max_replication_mb > 0) {
           max_replication_bytes = (svr->GetConfig()->max_replication_mb*MiB) /
@@ -4456,12 +4534,15 @@ class CommandCluster : public Commander {
     if (subcommand_ == "keyslot" && args_.size() == 3) return Status::OK();
     if (subcommand_ == "import") {
       if (args.size() != 4) return Status(Status::RedisParseErr, errWrongNumOfArguments);
-      try {
-        slot_ = atoi(args[2].c_str());
-        state_ = static_cast<ImportStatus>(atoi(args[3].c_str()));
-      } catch (std::exception &e) {
-        return Status(Status::RedisParseErr, errValueNotInterger);
-      }
+      auto s = Util::DecimalStringToNum(args[2], &slot_);
+      if (!s.IsOK()) return s;
+
+      int64_t state;
+      s = Util::DecimalStringToNum(args[3], &state,
+                                  static_cast<int64_t>(kImportStart),
+                                  static_cast<int64_t>(kImportNone));
+      if (!s.IsOK()) return Status(Status::NotOK, "Invalid import state");
+      state_ = static_cast<ImportStatus>(state);
       return Status::OK();
     }
     return Status(Status::RedisParseErr,
@@ -4518,7 +4599,7 @@ class CommandCluster : public Commander {
         *output = Redis::Error(s.Msg());
       }
     } else if (subcommand_ == "import") {
-      Status s = svr->cluster_->ImportSlot(conn, slot_, state_);
+      Status s = svr->cluster_->ImportSlot(conn, static_cast<int>(slot_), state_);
       if (s.IsOK()) {
       *output = Redis::SimpleString("OK");
       } else {
@@ -4532,7 +4613,7 @@ class CommandCluster : public Commander {
 
  private:
   std::string subcommand_;
-  int slot_ = -1;
+  int64_t slot_ = -1;
   ImportStatus state_ = kImportNone;
 };
 
@@ -4546,12 +4627,9 @@ class CommandClusterX : public Commander {
         args_[2].size() == kClusterNodeIdLen) return Status::OK();
     if (subcommand_ == "migrate") {
       if (args.size() != 4) return Status(Status::RedisParseErr, errWrongNumOfArguments);
-      try {
-        slot_ = atoi(args[2].c_str());
-        dst_node_id_ = args[3];
-      } catch (std::exception &e) {
-        return Status(Status::RedisParseErr, errValueNotInterger);
-      }
+      auto s = Util::DecimalStringToNum(args[2], &slot_);
+      if (!s.IsOK()) return s;
+      dst_node_id_ = args[3];
       return Status::OK();
     }
     if (subcommand_ == "setnodes" && args_.size() >= 4) {
@@ -4622,7 +4700,7 @@ class CommandClusterX : public Commander {
       int64_t v = svr->cluster_->GetVersion();
       *output = Redis::BulkString(std::to_string(v));
     } else if (subcommand_ == "migrate") {
-      Status s = svr->cluster_->MigrateSlot(slot_, dst_node_id_);
+      Status s = svr->cluster_->MigrateSlot(static_cast<int>(slot_), dst_node_id_);
       if (s.IsOK()) {
         *output = Redis::SimpleString("OK");
       } else {
@@ -4641,7 +4719,7 @@ class CommandClusterX : public Commander {
   int slot_id_ = -1;
   bool force_ = false;
   std::string dst_node_id_;
-  int slot_ = -1;
+  int64_t slot_ = -1;
 };
 
 class CommandEval : public Commander {
@@ -4713,6 +4791,867 @@ class CommandScript : public Commander {
   std::string subcommand_;
 };
 
+class CommandXAdd : public Commander {
+ public:
+  Status Parse(const std::vector<std::string> &args) override {
+    bool entry_id_found = false;
+    stream_name_ = args[1];
+
+    for (size_t i = 2; i < args.size(); ) {
+      auto val = entry_id_found ? args[i] : Util::ToLower(args[i]);
+
+      if (val == "nomkstream" && !entry_id_found) {
+        nomkstream_ = true;
+        ++i;
+        continue;
+      }
+
+      if (val == "maxlen" && !entry_id_found) {
+        if (i+1 >= args.size()) {
+          return Status(Status::RedisParseErr, errInvalidSyntax);
+        }
+
+        size_t max_len_idx;
+        bool eq_sign_found = false;
+        if (args[i+1] == "=") {
+          max_len_idx = i+2;
+          eq_sign_found = true;
+        } else {
+          max_len_idx = i+1;
+        }
+
+        if (max_len_idx >= args.size()) {
+          return Status(Status::RedisParseErr, errInvalidSyntax);
+        }
+
+        try {
+          max_len_ = std::stoull(args[max_len_idx]);
+          with_max_len_ = true;
+        } catch (const std::exception &) {
+          return Status(Status::RedisParseErr, errValueNotInterger);
+        }
+
+        i += eq_sign_found ? 3 : 2;
+        continue;
+      }
+
+      if (val == "minid" && !entry_id_found) {
+        if (i+1 >= args.size()) {
+          return Status(Status::RedisParseErr, errInvalidSyntax);
+        }
+
+        size_t min_id_idx;
+        bool eq_sign_found = false;
+        if (args[i+1] == "=") {
+          min_id_idx = i+2;
+          eq_sign_found = true;
+        } else {
+          min_id_idx = i+1;
+        }
+
+        if (min_id_idx >= args.size()) {
+          return Status(Status::RedisParseErr, errInvalidSyntax);
+        }
+
+        auto s = ParseStreamEntryID(args[min_id_idx], &min_id_);
+        if (!s.IsOK()) {
+          return Status(Status::RedisParseErr, s.Msg());
+        }
+
+        with_min_id_ = true;
+        i += eq_sign_found ? 3 : 2;
+        continue;
+      }
+
+      if (val == "limit" && !entry_id_found) {
+        return Status(Status::RedisParseErr, errLimitOptionNotAllowed);
+      }
+
+      if (val == "*" && !entry_id_found) {
+        entry_id_found = true;
+        ++i;
+        continue;
+      } else if (!entry_id_found) {
+        auto s = ParseNewStreamEntryID(val, &entry_id_);
+        if (!s.IsOK()) {
+          return Status(Status::RedisParseErr, s.Msg());
+        }
+        entry_id_found = true;
+        with_entry_id_ = true;
+        ++i;
+        continue;
+      }
+
+      if (entry_id_found) {
+        name_value_pairs_.push_back(val);
+        ++i;
+      }
+    }
+
+    if (name_value_pairs_.empty() || name_value_pairs_.size() % 2 != 0) {
+      return Status(Status::RedisParseErr, errWrongNumOfArguments);
+    }
+
+    return Status::OK();
+  }
+
+  Status Execute(Server *svr, Connection *conn, std::string *output) override {
+    Redis::StreamAddOptions options;
+    options.nomkstream = nomkstream_;
+    if (with_max_len_) {
+      options.trim_options.strategy = StreamTrimStrategy::MaxLen;
+      options.trim_options.max_len = max_len_;
+    }
+    if (with_min_id_) {
+      options.trim_options.strategy = StreamTrimStrategy::MinID;
+      options.trim_options.min_id = min_id_;
+    }
+    if (with_entry_id_) {
+      options.with_entry_id = true;
+      options.entry_id = entry_id_;
+    }
+
+    Redis::Stream stream_db(svr->storage_, conn->GetNamespace());
+    StreamEntryID entry_id;
+    auto s = stream_db.Add(stream_name_, options, name_value_pairs_, &entry_id);
+    if (!s.ok() && !s.IsNotFound()) {
+      return Status(Status::RedisExecErr, s.ToString());
+    }
+
+    if (s.IsNotFound() && nomkstream_) {
+      *output = Redis::NilString();
+      return Status::OK();
+    }
+
+    *output = Redis::BulkString(entry_id.ToString());
+
+    svr->OnEntryAddedToStream(conn->GetNamespace(), stream_name_, entry_id);
+
+    return Status::OK();
+  }
+
+ private:
+  std::string stream_name_;
+  uint64_t max_len_ = 0;
+  Redis::StreamEntryID min_id_;
+  Redis::NewStreamEntryID entry_id_;
+  std::vector<std::string> name_value_pairs_;
+  bool nomkstream_ = false;
+  bool with_max_len_ = false;
+  bool with_min_id_ = false;
+  bool with_entry_id_ = false;
+};
+
+class CommandXDel : public Commander {
+ public:
+  Status Parse(const std::vector<std::string> &args) override {
+    for (size_t i = 2; i < args.size(); ++i) {
+      Redis::StreamEntryID id;
+      auto s = ParseStreamEntryID(args[i], &id);
+      if (!s.IsOK()) {
+        return s;
+      }
+      ids_.push_back(id);
+    }
+    return Status::OK();
+  }
+
+  Status Execute(Server *svr, Connection *conn, std::string *output) override {
+    Redis::Stream stream_db(svr->storage_, conn->GetNamespace());
+    uint64_t deleted;
+    auto s = stream_db.DeleteEntries(args_[1], ids_, &deleted);
+    if (!s.ok()) {
+      return Status(Status::RedisExecErr, s.ToString());
+    }
+
+    *output = Redis::Integer(deleted);
+
+    return Status::OK();
+  }
+
+ private:
+  std::vector<Redis::StreamEntryID> ids_;
+};
+
+class CommandXLen : public Commander {
+ public:
+  Status Execute(Server *svr, Connection *conn, std::string *output) override {
+    Redis::Stream stream_db(svr->storage_, conn->GetNamespace());
+    uint64_t len;
+    auto s = stream_db.Len(args_[1], &len);
+    if (!s.ok()) {
+      return Status(Status::RedisExecErr, s.ToString());
+    }
+
+    *output = Redis::Integer(len);
+
+    return Status::OK();
+  }
+};
+
+class CommandXInfo : public Commander {
+ public:
+  Status Parse(const std::vector<std::string> &args) override {
+    auto val = Util::ToLower(args[1]);
+    if (val == "stream" && args.size() >= 2) {
+      stream_ = true;
+      if (args.size() > 3 && Util::ToLower(args[3]) == "full") {
+        full_ = true;
+      }
+      if (args.size() > 5 && Util::ToLower(args[4]) == "count") {
+        try {
+          count_ = std::stoull(args[5]);
+        } catch (const std::exception &) {
+          return Status(Status::RedisParseErr, errValueNotInterger);
+        }
+      }
+    }
+    return Status::OK();
+  }
+
+  Status Execute(Server *svr, Connection *conn, std::string *output) override {
+    if (stream_) {
+      return getStreamInfo(svr, conn, output);
+    }
+    return Status::OK();
+  }
+
+ private:
+  uint64_t count_ = 10;  // default Redis value
+  bool stream_ = false;
+  bool full_ = false;
+
+  Status getStreamInfo(Server *svr, Connection *conn, std::string *output) {
+    Redis::Stream stream_db(svr->storage_, conn->GetNamespace());
+    Redis::StreamInfo info;
+    auto s = stream_db.GetStreamInfo(args_[2], full_, count_, &info);
+    if (!s.ok() && !s.IsNotFound()) {
+      return Status(Status::RedisExecErr, s.ToString());
+    }
+
+    if (s.IsNotFound()) {
+      return Status(Status::RedisExecErr, errNoSuchKey);
+    }
+
+    if (!full_) {
+      output->append(Redis::MultiLen(14));
+    } else {
+      output->append(Redis::MultiLen(12));
+    }
+    output->append(Redis::BulkString("length"));
+    output->append(Redis::Integer(info.size));
+    output->append(Redis::BulkString("last-generated-id"));
+    output->append(Redis::BulkString(info.last_generated_id.ToString()));
+    output->append(Redis::BulkString("max-deleted-entry-id"));
+    output->append(Redis::BulkString(info.max_deleted_entry_id.ToString()));
+    output->append(Redis::BulkString("entries-added"));
+    output->append(Redis::Integer(info.entries_added));
+    output->append(Redis::BulkString("recorded-first-entry-id"));
+    output->append(Redis::BulkString(info.recorded_first_entry_id.ToString()));
+    if (!full_) {
+      output->append(Redis::BulkString("first-entry"));
+      if (info.first_entry) {
+        output->append(Redis::MultiLen(2));
+        output->append(Redis::BulkString(info.first_entry->key));
+        output->append(Redis::MultiBulkString(info.first_entry->values));
+      } else {
+        output->append(Redis::NilString());
+      }
+      output->append(Redis::BulkString("last-entry"));
+      if (info.last_entry) {
+        output->append(Redis::MultiLen(2));
+        output->append(Redis::BulkString(info.last_entry->key));
+        output->append(Redis::MultiBulkString(info.last_entry->values));
+      } else {
+        output->append(Redis::NilString());
+      }
+    } else {
+      output->append(Redis::BulkString("entries"));
+      output->append(Redis::MultiLen(info.entries.size()));
+      for (const auto& e : info.entries) {
+        output->append(Redis::MultiLen(2));
+        output->append(Redis::BulkString(e.key));
+        output->append(Redis::MultiBulkString(e.values));
+      }
+    }
+
+    return Status::OK();
+  }
+};
+
+class CommandXRange : public Commander {
+ public:
+  Status Parse(const std::vector<std::string> &args) override {
+    stream_name_ = args[1];
+
+    if (args[2] == "-") {
+      start_ = Redis::StreamEntryID::Minimum();
+    } else if (args[2][0] == '(') {
+      exclude_start_ = true;
+      auto s = ParseRangeStart(args[2].substr(1), &start_);
+      if (!s.IsOK()) return s;
+    } else if (args[2] == "+") {
+      start_ = Redis::StreamEntryID::Maximum();
+    } else {
+      auto s = ParseRangeStart(args[2], &start_);
+      if (!s.IsOK()) return s;
+    }
+
+    if (args[3] == "+") {
+      end_ = Redis::StreamEntryID::Maximum();
+    } else if (args[3][0] == '(') {
+      exclude_end_ = true;
+      auto s = ParseRangeEnd(args[3].substr(1), &end_);
+      if (!s.IsOK()) return s;
+    } else if (args[3] == "-") {
+      end_ = Redis::StreamEntryID::Minimum();
+    } else {
+      auto s = ParseRangeEnd(args[3], &end_);
+      if (!s.IsOK()) return s;
+    }
+
+    if (args.size() >= 5 && Util::ToLower(args[4]) == "count") {
+      if (args.size() != 6) {
+        return Status(Status::RedisParseErr, errInvalidSyntax);
+      }
+
+      try {
+        with_count_ = true;
+        count_ = std::stoull(args[5]);
+      } catch (const std::exception &) {
+        return Status(Status::RedisParseErr, errValueNotInterger);
+      }
+    }
+
+    return Status::OK();
+  }
+
+  Status Execute(Server *svr, Connection *conn, std::string *output) override {
+    if (with_count_ && count_ == 0) {
+      *output = Redis::NilString();
+      return Status::OK();
+    }
+
+    Redis::Stream stream_db(svr->storage_, conn->GetNamespace());
+
+    Redis::StreamRangeOptions options;
+    options.reverse = false;
+    options.start = start_;
+    options.end = end_;
+    options.with_count = with_count_;
+    options.count = count_;
+    options.exclude_start = exclude_start_;
+    options.exclude_end = exclude_end_;
+
+    std::vector<StreamEntry> result;
+    auto s = stream_db.Range(stream_name_, options, &result);
+    if (!s.ok()) {
+      return Status(Status::RedisExecErr, s.ToString());
+    }
+
+    output->append(Redis::MultiLen(result.size()));
+
+    for (const auto &e : result) {
+      output->append(Redis::MultiLen(2));
+      output->append(Redis::BulkString(e.key));
+      output->append(Redis::MultiBulkString(e.values));
+    }
+
+    return Status::OK();
+  }
+
+ private:
+  std::string stream_name_;
+  StreamEntryID start_;
+  StreamEntryID end_;
+  uint64_t count_ = 0;
+  bool exclude_start_ = false;
+  bool exclude_end_ = false;
+  bool with_count_ = false;
+};
+
+class CommandXRevRange : public Commander {
+ public:
+  Status Parse(const std::vector<std::string> &args) override {
+    stream_name_ = args[1];
+
+    if (args[2] == "+") {
+      start_ = Redis::StreamEntryID::Maximum();
+    } else if (args[2][0] == '(') {
+      exclude_start_ = true;
+      auto s = ParseRangeEnd(args[2].substr(1), &start_);
+      if (!s.IsOK()) return s;
+    } else if (args[2] == "-") {
+      start_ = Redis::StreamEntryID::Minimum();
+    } else {
+      auto s = ParseRangeEnd(args[2], &start_);
+      if (!s.IsOK()) return s;
+    }
+
+    if (args[3] == "-") {
+      end_ = Redis::StreamEntryID::Minimum();
+    } else if (args[3][0] == '(') {
+      exclude_end_ = true;
+      auto s = ParseRangeStart(args[3].substr(1), &end_);
+      if (!s.IsOK()) return s;
+    } else if (args[3] == "+") {
+      end_ = Redis::StreamEntryID::Maximum();
+    } else {
+      auto s = ParseRangeStart(args[3], &end_);
+      if (!s.IsOK()) return s;
+    }
+
+    if (args.size() >= 5 && Util::ToLower(args[4]) == "count") {
+      if (args.size() != 6) {
+        return Status(Status::RedisParseErr, errInvalidSyntax);
+      }
+
+      try {
+        with_count_ = true;
+        count_ = std::stoull(args[5]);
+      } catch (const std::exception &) {
+        return Status(Status::RedisParseErr, errValueNotInterger);
+      }
+    }
+
+     return Status::OK();
+  }
+
+  Status Execute(Server *svr, Connection *conn, std::string *output) override {
+    if (with_count_ && count_ == 0) {
+      *output = Redis::NilString();
+      return Status::OK();
+    }
+
+    Redis::Stream stream_db(svr->storage_, conn->GetNamespace());
+
+    Redis::StreamRangeOptions options;
+    options.reverse = true;
+    options.start = start_;
+    options.end = end_;
+    options.with_count = with_count_;
+    options.count = count_;
+    options.exclude_start = exclude_start_;
+    options.exclude_end = exclude_end_;
+
+    std::vector<StreamEntry> result;
+    auto s = stream_db.Range(stream_name_, options, &result);
+    if (!s.ok()) {
+      return Status(Status::RedisExecErr, s.ToString());
+    }
+
+    output->append(Redis::MultiLen(result.size()));
+
+    for (const auto &e : result) {
+      output->append(Redis::MultiLen(2));
+      output->append(Redis::BulkString(e.key));
+      output->append(Redis::MultiBulkString(e.values));
+    }
+
+    return Status::OK();
+  }
+
+ private:
+  std::string stream_name_;
+  StreamEntryID start_;
+  StreamEntryID end_;
+  uint64_t count_ = 0;
+  bool exclude_start_ = false;
+  bool exclude_end_ = false;
+  bool with_count_ = false;
+};
+
+class CommandXRead : public Commander {
+ public:
+  Status Parse(const std::vector<std::string> &args) override {
+    size_t streams_word_idx = 0;
+
+    for (size_t i = 1; i < args.size();) {
+      auto arg = Util::ToLower(args[i]);
+
+      if (arg == "streams") {
+        streams_word_idx = i;
+        break;
+      }
+
+      if (arg == "count") {
+        if (i+1 >= args.size()) {
+          return Status(Status::RedisParseErr, errInvalidSyntax);
+        }
+
+        try {
+          with_count_ = true;
+          count_ = static_cast<uint64_t>(std::stoll(args[i+1]));
+        } catch (const std::exception &) {
+          return Status(Status::RedisParseErr, errValueNotInterger);
+        }
+        i += 2;
+        continue;
+      }
+
+      if (arg == "block") {
+        if (i+1 >= args.size()) {
+          return Status(Status::RedisParseErr, errInvalidSyntax);
+        }
+
+        block_ = true;
+        try {
+          auto v = std::stoll(args[i+1]);
+          if (v < 0) {
+            return Status(Status::RedisParseErr, errTimeoutIsNegative);
+          }
+          block_timeout_ = v;
+        } catch (const std::exception &) {
+          return Status(Status::RedisParseErr, errValueNotInterger);
+        }
+        i += 2;
+        continue;
+      }
+
+      ++i;
+    }
+
+    if (streams_word_idx == 0) {
+      return Status(Status::RedisParseErr, errInvalidSyntax);
+    }
+
+    if ((args.size() - streams_word_idx - 1) % 2 != 0) {
+      return Status(Status::RedisParseErr, errUnbalacedStreamList);
+    }
+
+    size_t number_of_streams = (args.size() - streams_word_idx - 1) / 2;
+
+    for (size_t i = streams_word_idx + 1; i <= streams_word_idx + number_of_streams; ++i) {
+      streams_.push_back(args[i]);
+      auto id_str = args[i + number_of_streams];
+      bool get_latest = id_str == "$";
+      latest_marks_.push_back(get_latest);
+      StreamEntryID id;
+      if (!get_latest) {
+        auto s = ParseStreamEntryID(id_str, &id);
+        if (!s.IsOK()) {
+          return s;
+        }
+      }
+      ids_.push_back(id);
+    }
+
+    return Status::OK();
+  }
+
+  Status Execute(Server *svr, Connection *conn, std::string *output) override {
+    Redis::Stream stream_db(svr->storage_, conn->GetNamespace());
+
+    std::vector<Redis::StreamReadResult> results;
+
+    for (size_t i = 0; i < streams_.size(); ++i) {
+      if (latest_marks_[i]) {
+        continue;
+      }
+
+      Redis::StreamRangeOptions options;
+      options.reverse = false;
+      options.start = ids_[i];
+      options.end = StreamEntryID{UINT64_MAX, UINT64_MAX};
+      options.with_count = with_count_;
+      options.count = count_;
+      options.exclude_start = true;
+      options.exclude_end = false;
+
+      std::vector<StreamEntry> result;
+      auto s = stream_db.Range(streams_[i], options, &result);
+      if (!s.ok() && !s.IsNotFound()) {
+        return Status(Status::RedisExecErr, s.ToString());
+      }
+
+      if (result.size() > 0) {
+        results.emplace_back(streams_[i], result);
+      }
+    }
+
+    if (block_ && results.empty()) {
+      if (conn->IsInExec()) {
+        *output = Redis::MultiLen(-1);
+        return Status::OK();  // No blocking in multi-exec
+      }
+
+      return blockingRead(svr, conn, &stream_db);
+    }
+
+    if (!block_ && results.empty()) {
+      *output = Redis::MultiLen(-1);
+      return Status::OK();
+    }
+
+    return sendResults(output, results);
+  }
+
+  Status sendResults(std::string *output, const std::vector<StreamReadResult> &results) {
+    output->append(Redis::MultiLen(results.size()));
+
+    for (size_t i = 0; i < results.size(); ++i) {
+      output->append(Redis::MultiLen(2));
+      output->append(Redis::BulkString(results[i].name));
+      output->append(Redis::MultiLen(results[i].entries.size()));
+      for (size_t j = 0; j < results[i].entries.size(); ++j) {
+        output->append(Redis::MultiLen(2));
+        output->append(Redis::BulkString(results[i].entries[j].key));
+        output->append(Redis::MultiBulkString(results[i].entries[j].values));
+      }
+    }
+
+    return Status::OK();
+  }
+
+  Status blockingRead(Server *svr, Connection *conn, Redis::Stream *stream_db) {
+    if (!with_count_) {
+      with_count_ = true;
+      count_ = blocked_default_count_;
+    }
+
+    for (size_t i = 0; i < streams_.size(); ++i) {
+      if (latest_marks_[i]) {
+        StreamEntryID last_generated_id;;
+        auto s = stream_db->GetLastGeneratedID(streams_[i], &last_generated_id);
+        if (!s.ok()) {
+          return Status(Status::RedisExecErr, s.ToString());
+        }
+
+        ids_[i] = last_generated_id;
+      }
+    }
+
+    svr_ = svr;
+    conn_ = conn;
+
+    svr_->BlockOnStreams(streams_, ids_, conn_);
+
+    auto bev = conn->GetBufferEvent();
+    bufferevent_setcb(bev, nullptr, WriteCB, EventCB, this);
+
+    if (block_timeout_ > 0) {
+      timer_ = evtimer_new(bufferevent_get_base(bev), TimerCB, this);
+      timeval tm;
+      if (block_timeout_ > 1000) {
+        tm.tv_sec = block_timeout_ / 1000;
+        tm.tv_usec = (block_timeout_ % 1000) * 1000;
+      } else {
+        tm.tv_sec = 0;
+        tm.tv_usec = block_timeout_ * 1000;
+      }
+
+      evtimer_add(timer_, &tm);
+    }
+
+    return Status::OK();
+  }
+
+  static void WriteCB(bufferevent *bev, void *ctx) {
+    auto command = reinterpret_cast<CommandXRead *>(ctx);
+
+    if (command->timer_ != nullptr) {
+      event_free(command->timer_);
+      command->timer_ = nullptr;
+    }
+
+    command->unblockAll();
+    bufferevent_setcb(bev, Redis::Connection::OnRead, Redis::Connection::OnWrite,
+                      Redis::Connection::OnEvent, command->conn_);
+    bufferevent_enable(bev, EV_READ);
+
+    Redis::Stream stream_db(command->svr_->storage_, command->conn_->GetNamespace());
+
+    std::vector<StreamReadResult> results;
+
+    for (size_t i = 0; i < command->streams_.size(); ++i) {
+      Redis::StreamRangeOptions options;
+      options.reverse = false;
+      options.start = command->ids_[i];
+      options.end = StreamEntryID{UINT64_MAX, UINT64_MAX};
+      options.with_count = command->with_count_;
+      options.count = command->count_;
+      options.exclude_start = true;
+      options.exclude_end = false;
+
+      std::vector<StreamEntry> result;
+      auto s = stream_db.Range(command->streams_[i], options, &result);
+      if (!s.ok()) {
+        command->conn_->Reply(Redis::MultiLen(-1));
+        LOG(ERROR) << "ERR executing XRANGE for stream " << command->streams_[i] << " from "
+                   << command->ids_[i].ToString() << " to " << options.end.ToString()
+                   << " with count " << command->count_ << ": " << s.ToString();
+      }
+
+      if (result.size() > 0) {
+        results.emplace_back(command->streams_[i], result);
+      }
+    }
+
+    if (results.empty()) {
+      command->conn_->Reply(Redis::MultiLen(-1));
+    }
+
+    command->sendReply(results);
+  }
+
+  void sendReply(const std::vector<StreamReadResult> &results) {
+    std::string output;
+
+    output.append(Redis::MultiLen(results.size()));
+
+    for (size_t i = 0; i < results.size(); ++i) {
+      output.append(Redis::MultiLen(2));
+      output.append(Redis::BulkString(results[i].name));
+      output.append(Redis::MultiLen(results[i].entries.size()));
+      for (size_t j = 0; j < results[i].entries.size(); ++j) {
+        output.append(Redis::MultiLen(2));
+        output.append(Redis::BulkString(results[i].entries[j].key));
+        output.append(Redis::MultiBulkString(results[i].entries[j].values));
+      }
+    }
+
+    conn_->Reply(output);
+  }
+
+  static void EventCB(bufferevent *bev, int16_t events, void *ctx) {
+    auto command = static_cast<CommandXRead *>(ctx);
+
+    if (events & (BEV_EVENT_EOF | BEV_EVENT_ERROR)) {
+      if (command->timer_ != nullptr) {
+        event_free(command->timer_);
+        command->timer_ = nullptr;
+      }
+      command->unblockAll();
+    }
+    Redis::Connection::OnEvent(bev, events, command->conn_);
+  }
+
+  static void TimerCB(int, int16_t events, void *ctx) {
+    auto command = reinterpret_cast<CommandXRead *>(ctx);
+
+    command->conn_->Reply(Redis::NilString());
+
+    event_free(command->timer_);
+    command->timer_ = nullptr;
+
+    command->unblockAll();
+
+    auto bev = command->conn_->GetBufferEvent();
+    bufferevent_setcb(bev, Redis::Connection::OnRead, Redis::Connection::OnWrite,
+                      Redis::Connection::OnEvent, command->conn_);
+    bufferevent_enable(bev, EV_READ);
+  }
+
+ private:
+  std::vector<std::string> streams_;
+  std::vector<StreamEntryID> ids_;
+  std::vector<bool> latest_marks_;
+  Server *svr_ = nullptr;
+  Connection *conn_ = nullptr;
+  event *timer_ = nullptr;
+  uint64_t count_ = 0;
+  int64_t block_timeout_ = 0;
+  int blocked_default_count_ = 1000;
+  bool with_count_ = false;
+  bool block_ = false;
+
+  void unblockAll() {
+    svr_->UnblockOnStreams(streams_, conn_);
+  }
+};
+
+class CommandXTrim : public Commander {
+ public:
+  Status Parse(const std::vector<std::string> &args) override {
+    bool eq_sign_found = false;
+
+    auto trim_strategy = Util::ToLower(args[2]);
+    if (trim_strategy == "maxlen") {
+      strategy_ = StreamTrimStrategy::MaxLen;
+
+      size_t max_len_idx;
+      if (args[3] != "=") {
+        max_len_idx = 3;
+      } else {
+        max_len_idx = 4;
+        eq_sign_found = true;
+      }
+
+      if (max_len_idx >= args.size()) {
+        return Status(Status::RedisParseErr, errInvalidSyntax);
+      }
+
+      try {
+        max_len_ = std::stoull(args[max_len_idx]);
+      } catch (const std::exception &) {
+        return Status(Status::RedisParseErr, errValueNotInterger);
+      }
+    } else if (trim_strategy == "minid") {
+      strategy_ = StreamTrimStrategy::MinID;
+
+      size_t min_id_idx;
+      if (args[3] != "=") {
+        min_id_idx = 3;
+      } else {
+        min_id_idx = 4;
+        eq_sign_found = true;
+      }
+
+      if (min_id_idx >= args.size()) {
+        return Status(Status::RedisParseErr, errInvalidSyntax);
+      }
+
+      auto s = ParseStreamEntryID(args[min_id_idx], &min_id_);
+      if (!s.IsOK()) {
+        return s;
+      }
+    } else {
+      return Status(Status::RedisParseErr, errInvalidSyntax);
+    }
+
+    bool limit_option_found = false;
+    if (eq_sign_found) {
+      if (args.size() > 6 && Util::ToLower(args[5]) == "limit") {
+        limit_option_found = true;
+      }
+    } else {
+      if (args.size() > 5 && Util::ToLower(args[4]) == "limit") {
+        limit_option_found = true;
+      }
+    }
+
+    if (limit_option_found) {
+      return Status(Status::RedisParseErr, errLimitOptionNotAllowed);
+    }
+
+    return Status::OK();
+  }
+
+  Status Execute(Server *svr, Connection *conn, std::string *output) override {
+    Redis::Stream stream_db(svr->storage_, conn->GetNamespace());
+
+    StreamTrimOptions options;
+    options.strategy = strategy_;
+    options.max_len = max_len_;
+    options.min_id = min_id_;
+
+    uint64_t removed;
+    auto s = stream_db.Trim(args_[1], options, &removed);
+    if (!s.ok()) {
+      return Status(Status::RedisExecErr, s.ToString());
+    }
+
+    *output = Redis::Integer(removed);
+
+    return Status::OK();
+  }
+
+ private:
+  uint64_t max_len_ = 0;
+  StreamEntryID min_id_;
+  StreamTrimStrategy strategy_ = StreamTrimStrategy::None;
+};
+
 #define ADD_CMD(name, arity, description , first_key, last_key, key_step, fn) \
 {name, arity, description, 0, first_key, last_key, key_step, []() -> std::unique_ptr<Commander> { \
   return std::unique_ptr<Commander>(new fn()); \
@@ -4759,6 +5698,7 @@ CommandAttributes redisCommandTable[] = {
     ADD_CMD("strlen", 2, "read-only", 1, 1, 1, CommandStrlen),
     ADD_CMD("getset", 3, "write", 1, 1, 1, CommandGetSet),
     ADD_CMD("getrange", 4, "read-only", 1, 1, 1, CommandGetRange),
+    ADD_CMD("getdel", 2, "write", 1, 1, 1, CommandGetDel),
     ADD_CMD("setrange", 4, "write", 1, 1, 1, CommandSetRange),
     ADD_CMD("mget", -2, "read-only", 1, -1, 1, CommandMGet),
     ADD_CMD("append", 3, "write", 1, 1, 1, CommandAppend),
@@ -4821,6 +5761,7 @@ CommandAttributes redisCommandTable[] = {
     ADD_CMD("scard", 2, "read-only", 1, 1, 1, CommandSCard),
     ADD_CMD("smembers", 2, "read-only", 1, 1, 1, CommandSMembers),
     ADD_CMD("sismember", 3, "read-only", 1, 1, 1, CommandSIsMember),
+    ADD_CMD("smismember", -3, "read-only", 1, 1, 1, CommandSMIsMember),
     ADD_CMD("spop", -2, "write", 1, 1, 1, CommandSPop),
     ADD_CMD("srandmember", -2, "read-only", 1, 1, 1, CommandSRandMember),
     ADD_CMD("smove", 4, "write", 1, 2, 1, CommandSMove),
@@ -4904,6 +5845,15 @@ CommandAttributes redisCommandTable[] = {
     ADD_CMD("_fetch_meta", 1, "read-only replication no-multi no-script", 0, 0, 0, CommandFetchMeta),
     ADD_CMD("_fetch_file", 2, "read-only replication no-multi no-script", 0, 0, 0, CommandFetchFile),
     ADD_CMD("_db_name", 1, "read-only replication no-multi", 0, 0, 0, CommandDBName),
+
+    ADD_CMD("xadd", -5, "write", 1, 1, 1, CommandXAdd),
+    ADD_CMD("xdel", -3, "write", 1, 1, 1, CommandXDel),
+    ADD_CMD("xlen", 2, "read-only", 1, 1, 1, CommandXLen),
+    ADD_CMD("xinfo", -2, "read-only", 0, 0, 0, CommandXInfo),
+    ADD_CMD("xrange", -4, "read-only", 1, 1, 1, CommandXRange),
+    ADD_CMD("xrevrange", -2, "read-only", 0, 0, 0, CommandXRevRange),
+    ADD_CMD("xread", -4, "read-only", 0, 0, 0, CommandXRead),
+    ADD_CMD("xtrim", -4, "write", 1, 1, 1, CommandXTrim),
 };
 
 // Command table after rename-command directive

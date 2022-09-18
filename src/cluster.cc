@@ -21,6 +21,7 @@
 #include <cassert>
 #include <cstring>
 #include <algorithm>
+#include <memory>
 
 #include "util.h"
 #include "server.h"
@@ -40,11 +41,11 @@ Cluster::Cluster(Server *svr, std::vector<std::string> binds, int port) :
   }
 }
 
-// We access cluster without lock, acutally we guarantte data-safe by work theads
+// We access cluster without lock, actually we guarantee data-safe by work threads
 // ReadWriteLockGuard, CLUSTER command doesn't have 'execlusive' attribute, i.e.
 // CLUSTER command can be executed concurrently, but some subcommand may change
 // cluster data, so these commands should be executed exclusively, and ReadWriteLock
-// also can guarantte accessing data is safe.
+// also can guarantee accessing data is safe.
 bool Cluster::SubCommandIsExecExclusive(const std::string &subcommand) {
   if (strcasecmp("setnodes", subcommand.c_str()) == 0) {
     return true;
@@ -507,7 +508,7 @@ Status Cluster::ParseClusterNodes(const std::string &nodes_str, ClusterNodes *no
   nodes->clear();
 
   // Parse all nodes
-  for (const auto& node_str : nodes_info) {
+  for (const auto &node_str : nodes_info) {
     std::vector<std::string> fields = Util::Split(node_str, " ");
     if (fields.size() < 5) {
       return Status(Status::ClusterInvalidInfo, "Invalid cluster nodes info");
@@ -552,8 +553,8 @@ Status Cluster::ParseClusterNodes(const std::string &nodes_str, ClusterNodes *no
         return Status(Status::ClusterInvalidInfo, "Invalid cluster nodes info");
       } else {
         // Create slave node
-        (*nodes)[id] = std::shared_ptr<ClusterNode>(
-          new ClusterNode(id, host, port, role, master_id, slots));
+        (*nodes)[id] = Util::MakeShared<ClusterNode>(
+          id, host, port, role, master_id, slots);
         continue;
       }
     }
@@ -597,8 +598,8 @@ Status Cluster::ParseClusterNodes(const std::string &nodes_str, ClusterNodes *no
     }
 
     // Create master node
-    (*nodes)[id] = std::shared_ptr<ClusterNode>(
-        new ClusterNode(id, host, port, role, master_id, slots));
+    (*nodes)[id] = Util::MakeShared<ClusterNode>(
+        id, host, port, role, master_id, slots);
   }
   return Status::OK();
 }
