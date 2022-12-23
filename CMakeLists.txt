@@ -159,7 +159,7 @@ if ((CMAKE_CXX_COMPILER_ID STREQUAL "GNU") OR (CMAKE_CXX_COMPILER_ID STREQUAL "C
 
     if(ENABLE_STATIC_LIBSTDCXX)
         try_compile(FOUND_STATIC_LIBSTDCXX ${PROJECT_BINARY_DIR} ${PROJECT_SOURCE_DIR}/cmake/checks/static_libstdcxx.cc
-            LINK_OPTIONS -static-libstdc++ CXX_STANDARD 11)
+            LINK_OPTIONS -static-libstdc++ CXX_STANDARD 17)
 
         if(NOT FOUND_STATIC_LIBSTDCXX)
             message(FATAL_ERROR "cannot find static library of libstdc++, please add ENABLE_STATIC_LIBSTDCXX=OFF to disable")
@@ -174,6 +174,10 @@ file(GLOB_RECURSE KVROCKS_SRCS src/*.cc)
 list(FILTER KVROCKS_SRCS EXCLUDE REGEX src/main.cc)
 
 add_library(kvrocks_objs OBJECT ${KVROCKS_SRCS})
+
+link_directories($ENV{HADOOP_HOME}/lib/native)
+link_directories($ENV{JAVA_HOME}/jre/lib/amd64/server)
+link_directories($ENV{JAVA_HOME}/jre/lib/amd64)
 
 target_include_directories(kvrocks_objs PUBLIC src src/common ${PROJECT_BINARY_DIR})
 target_compile_features(kvrocks_objs PUBLIC cxx_std_17)
