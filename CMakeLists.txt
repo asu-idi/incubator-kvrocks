@@ -160,7 +160,7 @@ if ((CMAKE_CXX_COMPILER_ID STREQUAL "GNU") OR (CMAKE_CXX_COMPILER_ID STREQUAL "C
 
     if(ENABLE_STATIC_LIBSTDCXX)
         try_compile(FOUND_STATIC_LIBSTDCXX ${PROJECT_BINARY_DIR} ${PROJECT_SOURCE_DIR}/cmake/checks/static_libstdcxx.cc
-            LINK_OPTIONS -static-libstdc++ CXX_STANDARD 11)
+            LINK_OPTIONS -static-libstdc++ CXX_STANDARD 17)
 
         if(NOT FOUND_STATIC_LIBSTDCXX)
             message(FATAL_ERROR "cannot find static library of libstdc++, please add ENABLE_STATIC_LIBSTDCXX=OFF to disable")
@@ -169,12 +169,23 @@ if ((CMAKE_CXX_COMPILER_ID STREQUAL "GNU") OR (CMAKE_CXX_COMPILER_ID STREQUAL "C
         set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libstdc++")
     endif()
 endif()
+  message(STATUS "Found zlib in ${zlib_SOURCE_DIR}")
 
+  add_library(zlib_with_headers INTERFACE) # rocksdb use it
+  target_include_directories(zlib_with_headers INTERFACE $<BUILD_INTERFACE:${zlib_SOURCE_DIR}> $<BUILD_INTERFACE:${zlib_BINARY_DIR}>)
+  target_link_libraries(zlib_with_headers INTERFACE zlibstatic)
+  add_library(ZLIB::ZLIB ALIAS zlib_with_headers)
+  install(TARGETS zlibstatic zlib_with_headers EXPORT RocksDBTargets) # export for install(...)
+  install(TARGETS zlibstatic zlib_with_headers EXPORT SpeedbTargets) # export for install(...)
 # kvrocks objects target
 file(GLOB_RECURSE KVROCKS_SRCS src/*.cc)
 list(FILTER KVROCKS_SRCS EXCLUDE REGEX src/main.cc)
 
 add_library(kvrocks_objs OBJECT ${KVROCKS_SRCS})
+
+link_directories($ENV{HADOOP_HOME}/lib/native)
+link_directories($ENV{JAVA_HOME}/jre/lib/amd64/server)
+link_directories($ENV{JAVA_HOME}/jre/lib/amd64)
 
 target_include_directories(kvrocks_objs PUBLIC src src/common ${PROJECT_BINARY_DIR})
 target_compile_features(kvrocks_objs PUBLIC cxx_std_17)

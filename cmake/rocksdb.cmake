@@ -25,16 +25,17 @@ endif()
 
 include(cmake/utils.cmake)
 
-FetchContent_DeclareGitHubWithMirror(rocksdb
-  facebook/rocksdb v7.9.2
-  MD5=f9e250f3afdc82288925778cf5513acd
+
+FetchContent_DeclareGitHubWithMirrorR(rocksdb
+  asu-idi/rocksdb_get_block_private.git
+  origin/cache_filter
 )
 
 FetchContent_GetProperties(jemalloc)
 FetchContent_GetProperties(snappy)
-
+message(STATUS "Project Source Directory: ${PROJECT_SOURCE_DIR}")
 FetchContent_MakeAvailableWithArgs(rocksdb
-  CMAKE_MODULE_PATH=${PROJECT_SOURCE_DIR}/cmake/modules # to locate FindJeMalloc.cmake
+	#	CMAKE_MODULE_PATH=${PROJECT_SOURCE_DIR}/cmake/modules # to locate FindJeMalloc.cmake
   Snappy_DIR=${PROJECT_SOURCE_DIR}/cmake/modules # to locate SnappyConfig.cmake
   FAIL_ON_WARNINGS=OFF
   WITH_TESTS=OFF
