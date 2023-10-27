@@ -182,7 +182,9 @@ struct Config {
     int max_bytes_for_level_base;
     int max_bytes_for_level_multiplier;
     bool level_compaction_dynamic_level_bytes;
-
+    bool use_direct_reads;
+    bool use_direct_io_for_flush_and_compaction;
+    
     struct WriteOptions {
       bool sync;
       bool disable_WAL;

@@ -205,7 +205,11 @@ Config::Config() {
        new IntField(&RocksDB.max_bytes_for_level_multiplier, 10, 1, 100)},
       {"rocksdb.level_compaction_dynamic_level_bytes", false,
        new YesNoField(&RocksDB.level_compaction_dynamic_level_bytes, false)},
-
+      {"rocksdb.use_direct_reads", true,
+       new YesNoField(&RocksDB.use_direct_reads, true)},
+      {"rocksdb.use_direct_io_for_flush_and_compaction", true,
+       new YesNoField(&RocksDB.use_direct_io_for_flush_and_compaction, true)},
+       
       /* rocksdb write options */
       {"rocksdb.write_options.sync", true, new YesNoField(&RocksDB.write_options.sync, false)},
       {"rocksdb.write_options.disable_wal", true, new YesNoField(&RocksDB.write_options.disable_WAL, false)},
