@@ -166,6 +166,14 @@ if ((CMAKE_CXX_COMPILER_ID STREQUAL "GNU") OR (CMAKE_CXX_COMPILER_ID STREQUAL "C
     endif()
 endif()
 
+message(STATUS "Found zlib in ${zlib_SOURCE_DIR}")
+
+add_library(zlib_with_headers INTERFACE) # rocksdb use it
+target_include_directories(zlib_with_headers INTERFACE $<BUILD_INTERFACE:${zlib_SOURCE_DIR}> $<BUILD_INTERFACE:${zlib_BINARY_DIR}>)
+target_link_libraries(zlib_with_headers INTERFACE zlibstatic)
+add_library(ZLIB::ZLIB ALIAS zlib_with_headers)
+install(TARGETS zlibstatic zlib_with_headers EXPORT RocksDBTargets) # export for install(...)
+
 # kvrocks objects target
 file(GLOB_RECURSE KVROCKS_SRCS src/*.cc)
 list(FILTER KVROCKS_SRCS EXCLUDE REGEX src/main.cc)

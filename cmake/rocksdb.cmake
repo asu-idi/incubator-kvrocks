@@ -26,8 +26,8 @@ endif()
 include(cmake/utils.cmake)
 
 FetchContent_DeclareGitHubWithMirrorR(rocksdb
-  asu-idi/rocksdb_get_block_private.git
-  origin/cache_filter
+  Change72/remote_flush.git
+  origin/v7.7.3-hdfs-kvrocks
 )
 
 FetchContent_GetProperties(jemalloc)
